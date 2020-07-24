@@ -2,37 +2,35 @@ package client
 
 import java.net.InetSocketAddress
 
-import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, Sync}
+import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode}
 import cats.syntax.all._
-import fs2.{Chunk, Stream}
 import fs2.io.tcp.{Socket, SocketGroup}
+import fs2.{Chunk, Stream}
+import models.UnencryptedMessage
 
-object Client {
-  def run[F[_]: Concurrent: ContextShift](
-    msgs: Stream[F, Array[Byte]]
-  ): F[ExitCode] =
+class Client[F[_]: Concurrent: ContextShift](msgs: List[UnencryptedMessage]) {
+  def run: F[ExitCode] =
     Blocker[F]
-      .use { blocker =>
-        SocketGroup[F](blocker).use { socketGroup =>
-          client[F](socketGroup, msgs)
-        }
-      }
+      .use(SocketGroup[F](_).use(client(_).compile.drain))
       .as(ExitCode.Success)
 
-  def client[F[_]: Concurrent: ContextShift](
-    socketGroup: SocketGroup,
-    stream:      Stream[F, Array[Byte]]
-  ): F[Unit] =
-    socketGroup.client(new InetSocketAddress("localhost", 5555)).use { socket =>
-      stream.map(msg => fire(socket, msg)).compile.drain
-    }
+  def client(
+    socketGroup: SocketGroup
+  ): Stream[F, UnencryptedMessage] =
+    Stream
+      .resource(socketGroup.client(new InetSocketAddress("localhost", 5555)))
+      .flatMap(socketTest)
 
-  def fire[F[_]: Concurrent](socket: Socket[F], msg: Array[Byte]) =
-    socket.write(Chunk.bytes(msg)) >>
-    socket.read(8192).flatMap { response =>
-      Sync[F].delay {
-        println(s"Response: $response")
-        response
-      }
-    }
+  def decode(response: Chunk[Byte]): UnencryptedMessage =
+    UnencryptedMessage.codec.decode(response.toBitVector).require.value
+  private def socketTest(socket: Socket[F]): Stream[F, UnencryptedMessage] =
+    Stream
+      .emits(msgs)
+      .flatMap(toStream)
+      .through(socket.writes())
+      .drain
+      .onFinalize(socket.endOfOutput) ++ socket.reads(8092).chunks.map(decode)
+
+  private def toStream(msg: UnencryptedMessage) =
+    Stream.chunk(Chunk.bytes(UnencryptedMessage.toBytes(msg)))
 }
